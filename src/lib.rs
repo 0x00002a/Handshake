@@ -1,110 +1,62 @@
-use std::{cell::UnsafeCell, fmt::Debug, ptr::NonNull, sync::OnceLock};
+use std::{cell::UnsafeCell, fmt::Debug, ptr::NonNull, sync::{Arc, Mutex, OnceLock, RwLock}};
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Canceled;
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub struct Handshake<T> {
     // NotNull is & unless deduced otherwise
-    common: NonNull<OnceLock<UnsafeCell<Option<T>>>>
+    common: Arc<RwLock<Option<T>>>,
 }
 
 impl<T> Handshake<T> {
     pub fn new() -> (Handshake<T>, Handshake<T>) {
         // check expected to be elided during compilation
-        let common = unsafe { NonNull::new_unchecked(Box::into_raw(
-            Box::new(OnceLock::new())
-        ))};
-        (Handshake {common}, Handshake {common})
+        let common = Default::default();
+        let h1 = Handshake { common };
+        let common = h1.common.clone();
+        (h1, Handshake {common})
     }
 
     pub fn join<U, F: FnOnce(T, T) -> U>(self, value: T, f: F) -> Result<Option<U>, Canceled> {
-        let mut value = Some(value);
-        // access safe lock
-        let res = unsafe { self.common.as_ref() }.get_or_init(||
-            UnsafeCell::new(Some(value.take().unwrap()))
-        );
-        let combined = value.map_or(Ok(None), |value| {
-            // unique access if value present
-            let combined = unsafe { &mut*res.get() }
-                .take()
-                .map_or(Err(Canceled), |other| {
-                    Ok(Some((f)(other, value)))
-                });
-            // last reference, drop pointer
-            drop(unsafe { Box::from_raw(self.common.as_ptr()) });
-            combined
-        });
-        std::mem::forget(self); // consumes `self`
-        combined
+        let Ok(other) = self.try_pull()? else { return Err(Canceled); };
+        Ok(Some(f(other, value)))
     }
 
     pub fn try_push(self, value: T) -> Result<Result<(), (Self, T)>, T> {
-        let mut value = Some(value);
         // access safe lock
-        let res = unsafe { self.common.as_ref() }.get_or_init(||
-            UnsafeCell::new(Some(value.take().unwrap()))
-        );
-        if let Some(value) = value {
-            // value present, lock inhabited
-            if unsafe { &*res.get() }.is_none() {
-                // handshake was cancelled
-                drop(unsafe { Box::from_raw(self.common.as_ptr()) });
-                std::mem::forget(self); // consumes `self`
-                Err(value)
-            } else {
-                Ok(Err((self, value)))
-            }
-        } else {
-            std::mem::forget(self); // consumes `self`
-            Ok(Ok(()))
-        }
+        let mut common = self.common.write().unwrap();
+        assert!(common.is_none(), "try to push to already pushed handshake");
+        common.replace(value);
+        drop(common);
+        std::mem::forget(self); // consumes `self`
+        Ok(Ok(()))
     }
 
     pub fn try_pull(self) -> Result<Result<T, Self>, Canceled> {
         // access safe lock
-        if let Some(res) = unsafe { self.common.as_ref() }.get() {
-            // unique access if value present
-            if let Some(value) = unsafe { &mut*res.get() }.take() {
-                // last reference, drop pointer
-                drop(unsafe { Box::from_raw(self.common.as_ptr()) });
-                std::mem::forget(self); // consumes `self`
-                Ok(Ok(value))
-            } else {
-                // handshake was cancelled
-                drop(unsafe { Box::from_raw(self.common.as_ptr()) });
-                std::mem::forget(self); // consumes `self`
-                Err(Canceled)
-            }
-
-        } else {
+        let mut common = self.common.write().unwrap();
+        assert!(common.is_none(), "try to push to already pushed handshake");
+        if let Some(res) = common.take() {
+            Ok(Ok(res))
+        }
+        else {
+            drop(common);
             Ok(Err(self))
         }
     }
 
     pub fn is_set(&self) -> bool {
         // access safe lock
-        unsafe { self.common.as_ref() }.get().is_some()
+        self.common.read().unwrap().is_some()
     }
 }
 
-impl<T> Drop for Handshake<T> {
-    fn drop(&mut self) {
-        let mut canceled = false;
-        // access safe lock
-        let _ = unsafe { self.common.as_ref() }.get_or_init(|| {
-            canceled = true;
-            UnsafeCell::new(None)
-        });
-        if canceled { return; }; // handshake cancelled
-        // otherwise last reference, drop pointer
-        drop(unsafe { Box::from_raw(self.common.as_ptr()) });
+impl<T: PartialEq> PartialEq for Handshake<T> {
+    fn eq(&self, other: &Self) -> bool {
+        *self.common.read().unwrap() == *other.common.read().unwrap()
     }
 }
 
-unsafe impl<T: Send> Sync for Handshake<T> {}
-
-unsafe impl<T: Send> Send for Handshake<T> {}
 
 impl<T: Debug> Debug for Handshake<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
